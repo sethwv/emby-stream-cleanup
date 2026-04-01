@@ -139,9 +139,9 @@ class Plugin:
 
             parts = []
             if monitor_running:
-                parts.append("Monitor: running (this worker)")
+                parts.append("Monitor: running")
             elif remote_monitor:
-                parts.append("Monitor: running (another worker)")
+                parts.append("Monitor: running")
             else:
                 parts.append("Monitor: stopped")
 
