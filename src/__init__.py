@@ -190,3 +190,12 @@ class Plugin:
                 if not stopped_server and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
                     logger.info("Plugin stopping, sending Redis stop signal to orphaned debug server")
                     redis_client.set(REDIS_KEY_STOP, "1")
+
+        # Clear the autostart dedup key so the next discovery can re-autostart
+        try:
+            rc = get_redis_client()
+            if rc:
+                from .config import REDIS_KEY_LEADER
+                rc.delete(REDIS_KEY_LEADER + ":autostart_dedup")
+        except Exception:
+            pass
