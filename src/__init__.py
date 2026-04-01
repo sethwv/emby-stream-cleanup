@@ -1,7 +1,7 @@
 """Emby Stream Cleanup - package root.
 
 Dispatcharr discovers the plugin by importing this package and looking for
-the ``Plugin`` class.  Webhook handling, server management, and auto-start
+the ``Plugin`` class.  The stream monitor, debug server, and auto-start
 logic live in their own modules; this file only contains the plugin API.
 """
 
@@ -11,18 +11,22 @@ import time
 from .config import (
     PLUGIN_CONFIG, PLUGIN_FIELDS,
     REDIS_KEY_RUNNING, REDIS_KEY_HOST, REDIS_KEY_PORT, REDIS_KEY_STOP,
+    REDIS_KEY_MONITOR,
     DEFAULT_PORT, DEFAULT_HOST,
 )
-from .handler import WebhookHandler
-from .server import WebhookServer, get_current_server
+from .handler import StreamMonitor
+from .server import DebugServer, get_current_server
 from .autostart import attempt_autostart
 from .utils import get_redis_client, read_redis_flag, normalize_host, redis_decode
 
 logger = logging.getLogger(__name__)
 
+# Module-level monitor instance shared across actions
+_monitor = StreamMonitor()
+
 
 class Plugin:
-    """Dispatcharr Plugin - Emby stream cleanup via webhooks."""
+    """Dispatcharr Plugin - Emby stream cleanup via activity monitoring."""
 
     name        = PLUGIN_CONFIG["name"]
     description = PLUGIN_CONFIG["description"]
@@ -33,227 +37,134 @@ class Plugin:
 
     actions = [
         {
-            "id": "start_server",
-            "label": "Start Webhook Server",
-            "description": "Start the HTTP webhook server",
+            "id": "start_debug_server",
+            "label": "Start Debug Server",
+            "description": "Start the debug dashboard HTTP server",
             "button_label": "Start Server",
             "button_variant": "filled",
             "button_color": "green",
         },
         {
-            "id": "stop_server",
-            "label": "Stop Webhook Server",
-            "description": "Stop the HTTP webhook server",
+            "id": "stop_debug_server",
+            "label": "Stop Debug Server",
+            "description": "Stop the debug dashboard HTTP server",
             "button_label": "Stop Server",
             "button_variant": "filled",
             "button_color": "red",
         },
         {
-            "id": "restart_server",
-            "label": "Restart Webhook Server",
-            "description": "Restart the HTTP webhook server",
-            "button_label": "Restart Server",
-            "button_variant": "filled",
-            "button_color": "orange",
-        },
-        {
-            "id": "server_status",
-            "label": "Server Status",
-            "description": "Check if the webhook server is running",
+            "id": "status",
+            "label": "Status",
+            "description": "Check monitor and debug server status",
             "button_label": "Check Status",
             "button_variant": "filled",
             "button_color": "blue",
         },
     ]
 
-    # ── Initialisation ───────────────────────────────────────────────────────
+    # -- Initialisation --------------------------------------------------------
 
     def __init__(self):
-        self.handler = WebhookHandler()
-        attempt_autostart(self.handler)
+        attempt_autostart(_monitor)
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
-    def _get_redis_server_state(self):
-        """Return (redis_client, server_running, server_host, server_port)."""
-        redis_client = get_redis_client()
-        server_running = False
-        server_host = None
-        server_port = None
-
-        try:
-            if redis_client:
-                server_running = read_redis_flag(redis_client, REDIS_KEY_RUNNING)
-                if server_running:
-                    server_host = redis_decode(redis_client.get(REDIS_KEY_HOST)) or DEFAULT_HOST
-                    server_port = redis_decode(redis_client.get(REDIS_KEY_PORT)) or str(DEFAULT_PORT)
-        except Exception as e:
-            logger.debug(f"Could not read Redis server state: {e}")
-
-        return redis_client, server_running, server_host, server_port
-
-    # ── Action dispatcher ────────────────────────────────────────────────────
+    # -- Action dispatcher -----------------------------------------------------
 
     def run(self, action: str, params: dict, context: dict):
         """Execute a plugin action and return a result dict."""
         logger_ctx = context.get("logger", logger)
         settings   = context.get("settings", {})
 
-        redis_client, server_running_redis, server_host, server_port = self._get_redis_server_state()
-        current_server = get_current_server()
-
-        # ── start_server ─────────────────────────────────────────────────
-        if action == "start_server":
-            try:
-                import gevent  # noqa: F401
-                from gevent import pywsgi  # noqa: F401
-            except ImportError:
+        # -- start_debug_server ------------------------------------------------
+        if action == "start_debug_server":
+            server = get_current_server()
+            if server and server.is_running():
                 return {
                     "status": "error",
-                    "message": "gevent is not installed (unexpected - it is a Dispatcharr dependency)",
+                    "message": f"Debug server is already running on http://{server.host}:{server.port}/debug",
                 }
 
-            try:
-                port = int(settings.get("port", DEFAULT_PORT))
-                host = normalize_host(settings.get("host", DEFAULT_HOST), DEFAULT_HOST)
-                logger_ctx.info(f"Starting webhook server with host='{host}', port={port}")
-
-                if server_running_redis:
-                    return {
-                        "status": "error",
-                        "message": f"Webhook server is already running on http://{server_host}:{server_port}/webhook",
-                    }
-                if current_server and current_server.is_running():
-                    return {
-                        "status": "error",
-                        "message": f"Webhook server is already running on http://{current_server.host}:{current_server.port}/webhook",
-                    }
-
-                server = WebhookServer(self.handler, port=port, host=host)
-                if server.start(settings=settings):
-                    return {
-                        "status": "success",
-                        "message": "Webhook server started successfully",
-                        "webhook_url": f"http://{host}:{port}/webhook",
-                        "health_check": f"http://{host}:{port}/health",
-                    }
+            # Check Redis for remote instance
+            redis_client = get_redis_client()
+            if redis_client and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
+                rhost = redis_decode(redis_client.get(REDIS_KEY_HOST)) or DEFAULT_HOST
+                rport = redis_decode(redis_client.get(REDIS_KEY_PORT)) or str(DEFAULT_PORT)
                 return {
                     "status": "error",
-                    "message": "Failed to start webhook server. Port may already be in use.",
+                    "message": f"Debug server is already running on http://{rhost}:{rport}/debug (another worker)",
                 }
 
-            except Exception as e:
-                logger_ctx.error(f"Error starting webhook server: {e}", exc_info=True)
-                return {"status": "error", "message": f"Failed to start server: {str(e)}"}
-
-        # ── stop_server ──────────────────────────────────────────────────
-        elif action == "stop_server":
-            try:
-                if current_server and current_server.is_running():
-                    if current_server.stop():
-                        return {"status": "success", "message": "Webhook server stopped successfully"}
-
-                if redis_client:
-                    try:
-                        logger_ctx.info("Sending stop signal via Redis")
-                        redis_client.set(REDIS_KEY_STOP, "1")
-
-                        for _ in range(50):  # wait up to 5 s
-                            if not read_redis_flag(redis_client, REDIS_KEY_RUNNING):
-                                logger_ctx.info("Server confirmed shutdown via Redis")
-                                return {"status": "success", "message": "Webhook server stopped successfully"}
-                            time.sleep(0.1)
-
-                        logger_ctx.warning("Server did not confirm shutdown within 5s, force-cleaning Redis keys")
-                        redis_client.delete(REDIS_KEY_RUNNING, REDIS_KEY_HOST, REDIS_KEY_PORT, REDIS_KEY_STOP)
-                        return {
-                            "status": "warning",
-                            "message": "Stop signal sent but server did not confirm. Redis keys cleared.",
-                        }
-                    except Exception as e:
-                        return {"status": "error", "message": f"Failed to signal stop: {str(e)}"}
-
-                return {"status": "error", "message": "No running server found"}
-
-            except Exception as e:
-                logger_ctx.error(f"Error stopping webhook server: {e}", exc_info=True)
-                return {"status": "error", "message": f"Failed to stop server: {str(e)}"}
-
-        # ── restart_server ───────────────────────────────────────────────
-        elif action == "restart_server":
-            try:
-                if current_server and current_server.is_running():
-                    current_server.stop()
-
-                if redis_client:
-                    try:
-                        redis_client.set(REDIS_KEY_STOP, "1")
-                        stopped = False
-                        for _ in range(50):
-                            if not read_redis_flag(redis_client, REDIS_KEY_RUNNING):
-                                stopped = True
-                                break
-                            time.sleep(0.1)
-                        if not stopped:
-                            logger_ctx.warning("Server did not confirm shutdown within 5s during restart")
-                            redis_client.delete(REDIS_KEY_RUNNING, REDIS_KEY_HOST, REDIS_KEY_PORT, REDIS_KEY_STOP)
-                    except Exception as e:
-                        return {"status": "error", "message": f"Failed to stop server: {str(e)}"}
-
-                time.sleep(0.5)
-
-                if redis_client:
-                    try:
-                        redis_client.delete(REDIS_KEY_STOP)
-                    except Exception:
-                        pass
-
-                time.sleep(0.5)
-
-                port = int(settings.get("port", DEFAULT_PORT))
-                host = normalize_host(settings.get("host", DEFAULT_HOST), DEFAULT_HOST)
-
-                if redis_client and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
-                    return {"status": "error", "message": "Server is still running after stop attempt"}
-
-                server = WebhookServer(self.handler, port=port, host=host)
-                if server.start(settings=settings):
-                    return {
-                        "status": "success",
-                        "message": "Webhook server restarted successfully",
-                        "webhook_url": f"http://{host}:{port}/webhook",
-                    }
-                return {"status": "error", "message": "Server stopped but failed to restart"}
-
-            except Exception as e:
-                logger_ctx.error(f"Error restarting webhook server: {e}", exc_info=True)
-                return {"status": "error", "message": f"Failed to restart server: {str(e)}"}
-
-        # ── server_status ────────────────────────────────────────────────
-        elif action == "server_status":
-            if current_server and current_server.is_running():
+            port = int(settings.get("port", DEFAULT_PORT))
+            host = normalize_host(settings.get("host", DEFAULT_HOST), DEFAULT_HOST)
+            server = DebugServer(_monitor, port=port, host=host)
+            if server.start(settings=settings):
                 return {
                     "status": "success",
-                    "message": f"Webhook server is running on http://{current_server.host}:{current_server.port}/webhook",
-                    "running": True,
+                    "message": f"Debug server started on http://{host}:{port}/debug",
                 }
-            if server_running_redis:
-                return {
-                    "status": "success",
-                    "message": f"Webhook server is running on http://{server_host}:{server_port}/webhook (another worker)",
-                    "running": True,
-                }
+            return {"status": "error", "message": "Failed to start debug server. Port may be in use."}
+
+        # -- stop_debug_server -------------------------------------------------
+        elif action == "stop_debug_server":
+            server = get_current_server()
+            if server and server.is_running():
+                server.stop()
+                return {"status": "success", "message": "Debug server stopped"}
+
+            # Signal remote worker
+            redis_client = get_redis_client()
+            if redis_client and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
+                redis_client.set(REDIS_KEY_STOP, "1")
+                for _ in range(50):
+                    if not read_redis_flag(redis_client, REDIS_KEY_RUNNING):
+                        return {"status": "success", "message": "Debug server stopped"}
+                    time.sleep(0.1)
+                redis_client.delete(REDIS_KEY_RUNNING, REDIS_KEY_HOST, REDIS_KEY_PORT, REDIS_KEY_STOP)
+                return {"status": "warning", "message": "Stop signal sent but server did not confirm. Redis keys cleared."}
+
+            return {"status": "error", "message": "Debug server is not running"}
+
+        # -- status ------------------------------------------------------------
+        elif action == "status":
+            monitor_running = _monitor.is_running()
+            server = get_current_server()
+            server_running = server and server.is_running()
+
+            redis_client = get_redis_client()
+            remote_monitor = False
+            if redis_client:
+                try:
+                    remote_monitor = read_redis_flag(redis_client, REDIS_KEY_MONITOR)
+                except Exception:
+                    pass
+
+            parts = []
+            if monitor_running:
+                parts.append("Monitor: running (this worker)")
+            elif remote_monitor:
+                parts.append("Monitor: running (another worker)")
+            else:
+                parts.append("Monitor: stopped")
+
+            if server_running:
+                parts.append(f"Debug server: http://{server.host}:{server.port}/debug")
+            else:
+                parts.append("Debug server: stopped")
+
             return {
                 "status": "success",
-                "message": "Webhook server is not running",
-                "running": False,
+                "message": " | ".join(parts),
+                "running": monitor_running or remote_monitor,
             }
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
     def stop(self, context: dict):
         """Called when the plugin is disabled or Dispatcharr is shutting down."""
-        current_server = get_current_server()
-        if current_server and current_server.is_running():
-            logger.info("Plugin stopping — shutting down webhook server")
-            current_server.stop()
+        if _monitor.is_running():
+            logger.info("Plugin stopping, shutting down monitor")
+            _monitor.stop()
+
+        server = get_current_server()
+        if server and server.is_running():
+            logger.info("Plugin stopping, shutting down debug server")
+            server.stop()

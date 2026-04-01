@@ -1,458 +1,568 @@
-"""Webhook handler and stream cleanup logic.
+"""Stream monitor that polls Dispatcharr client activity.
 
-Tracks active Emby viewers per channel using Redis sets keyed by
-PlaySessionId.  When the last viewer stops watching a channel, schedules
-a delayed cleanup that terminates the matching Dispatcharr client
-connection after a configurable timeout.
+Periodically scans all active channels for clients matching the configured
+client identifier(s).  When a matching client's ``last_active`` timestamp
+exceeds the idle timeout, the connection is terminated via
+``ChannelService.stop_client()``.
+
+Optionally cross-references with an Emby/Jellyfin Sessions API to detect
+orphaned connections that the media server failed to close.
 """
 
+import json
 import logging
 import socket
+import threading
 import time
+import urllib.request
+import urllib.error
 
 from .config import (
-    REDIS_KEY_VIEWERS_PREFIX, VIEWER_SET_TTL, DEFAULT_CLEANUP_TIMEOUT,
+    DEFAULT_CLEANUP_TIMEOUT, DEFAULT_POLL_INTERVAL,
+    REDIS_KEY_MONITOR, REDIS_KEY_STOP,
 )
-from .utils import get_redis_client, redis_decode
+from .utils import get_redis_client, read_redis_flag, redis_decode
 
 logger = logging.getLogger(__name__)
 
-# Track pending cleanup greenlets so we can cancel if a viewer reconnects.
-# Maps channel_number (str) -> gevent.Greenlet
-_pending_cleanups = {}
-
-# Metadata for pending cleanups (for debug page).
-# Maps channel_number (str) -> {"scheduled_at": float, "timeout": int, "fires_at": float}
-_cleanup_metadata = {}
+# Channel states that indicate the stream is mid-failover or still starting up.
+# Clients appear idle during these states because no data is flowing yet.
+_GRACE_STATES = frozenset({"initializing", "connecting", "buffering", "waiting_for_clients"})
 
 
-class WebhookHandler:
-    """Processes Emby webhook events and manages stream cleanup."""
+def _get_failover_grace():
+    """Return the failover grace period (seconds) from Dispatcharr proxy config.
 
-    def handle_webhook(self, event_data, settings):
-        """Process an incoming Emby webhook payload.
+    During a stream switch Dispatcharr allows up to
+    ``FAILOVER_GRACE_PERIOD + BUFFERING_TIMEOUT`` before disconnecting
+    clients.  We use the same window so we don't kill sessions that are
+    just waiting for a new upstream to stabilise.
+    """
+    try:
+        from apps.proxy.config import TSConfig
+        settings = TSConfig.get_proxy_settings()
+        failover = getattr(TSConfig, "FAILOVER_GRACE_PERIOD", 20)
+        buffering = settings.get("buffering_timeout", 15)
+        return failover + buffering
+    except Exception:
+        return 35  # safe default: 20 + 15
 
-        Returns a dict suitable for JSON serialisation as the HTTP response.
-        """
-        event = event_data.get("Event", "")
-        if event not in ("playback.start", "playback.stop"):
-            return {"status": "ignored", "reason": f"Unhandled event: {event}"}
 
-        item = event_data.get("Item", {})
-        if item.get("Type") != "TvChannel":
-            return {"status": "ignored", "reason": "Not a TvChannel item"}
+class StreamMonitor:
+    """Background poller that watches Dispatcharr client activity and
+    terminates idle connections matching the configured identifier."""
 
-        channel_number = item.get("ChannelNumber") or item.get("Number")
-        if not channel_number:
-            return {"status": "ignored", "reason": "No channel number in payload"}
-        channel_number = str(channel_number)
+    def __init__(self):
+        self._thread = None
+        self._running = False
+        self._settings = {}
+        # Per-client tracking: {(channel_uuid, client_id): first_idle_ts}
+        # Records when we first noticed a client was idle so we can
+        # measure idle duration across poll cycles.
+        self._idle_since = {}
+        # Per-client orphan tracking: {(channel_uuid, client_id): first_orphan_ts}
+        self._orphaned_since = {}
+        # Snapshot for the debug page (updated each poll cycle)
+        self._last_scan = {}
+        self._last_scan_time = 0
+        self._stopped_log = []  # recent terminations for debug display
+        # Media server session state (updated each poll cycle)
+        self._emby_active_count = None  # None=not configured, int=session count
+        self._emby_error = None  # last error message, if any
 
-        playback_info = event_data.get("PlaybackInfo", {})
-        session_id = playback_info.get("PlaySessionId")
-        if not session_id:
-            return {"status": "ignored", "reason": "No PlaySessionId in payload"}
+    # ── Identifier helpers ───────────────────────────────────────────────────
 
-        user_name = event_data.get("User", {}).get("Name", "unknown")
-        item_name = item.get("Name", "unknown")
+    @staticmethod
+    def _parse_identifiers(client_identifier):
+        """Split a comma-separated identifier string into lowercased values."""
+        if not client_identifier:
+            return []
+        return [v.strip().lower() for v in client_identifier.split(",") if v.strip()]
 
-        if event == "playback.start":
-            return self._handle_start(channel_number, session_id, user_name, item_name, settings)
-        else:
-            return self._handle_stop(channel_number, session_id, user_name, item_name, settings)
-
-    def _handle_start(self, channel_number, session_id, user_name, item_name, settings):
-        """Register a new viewer on the channel."""
-        redis_client = get_redis_client()
-        if not redis_client:
-            logger.error("Cannot track viewer: Redis unavailable")
-            return {"status": "error", "reason": "Redis unavailable"}
-
-        viewer_key = f"{REDIS_KEY_VIEWERS_PREFIX}{channel_number}"
-        redis_client.sadd(viewer_key, session_id)
-        redis_client.expire(viewer_key, VIEWER_SET_TTL)
-
-        viewer_count = redis_client.scard(viewer_key)
-        logger.info(
-            f"Viewer started: user={user_name}, channel={channel_number} ({item_name}), "
-            f"session={session_id[:12]}..., viewers={viewer_count}"
-        )
-
-        # Cancel any pending cleanup for this channel since someone is watching
-        self._cancel_pending_cleanup(channel_number)
-
-        return {
-            "status": "ok",
-            "event": "playback.start",
-            "channel": channel_number,
-            "viewers": viewer_count,
-        }
-
-    def _handle_stop(self, channel_number, session_id, user_name, item_name, settings):
-        """Remove a viewer and schedule cleanup if no viewers remain."""
-        redis_client = get_redis_client()
-        if not redis_client:
-            logger.error("Cannot track viewer: Redis unavailable")
-            return {"status": "error", "reason": "Redis unavailable"}
-
-        viewer_key = f"{REDIS_KEY_VIEWERS_PREFIX}{channel_number}"
-        redis_client.srem(viewer_key, session_id)
-
-        viewer_count = redis_client.scard(viewer_key)
-        logger.info(
-            f"Viewer stopped: user={user_name}, channel={channel_number} ({item_name}), "
-            f"session={session_id[:12]}..., viewers_remaining={viewer_count}"
-        )
-
-        if viewer_count == 0:
-            timeout = int(settings.get("cleanup_timeout", DEFAULT_CLEANUP_TIMEOUT))
-            emby_identifier = (settings.get("emby_identifier") or "").strip()
-
-            if not emby_identifier:
-                logger.warning(
-                    f"Channel {channel_number} has 0 viewers but no emby_identifier configured — "
-                    f"skipping cleanup. Set the Emby Identifier in plugin settings."
-                )
-                return {
-                    "status": "ok",
-                    "event": "playback.stop",
-                    "channel": channel_number,
-                    "viewers": 0,
-                    "cleanup": "skipped",
-                    "reason": "No emby_identifier configured",
-                }
-
-            logger.info(
-                f"Channel {channel_number} has 0 viewers, scheduling cleanup in {timeout}s"
-            )
-            self._schedule_cleanup(channel_number, timeout, emby_identifier)
-
-            return {
-                "status": "ok",
-                "event": "playback.stop",
-                "channel": channel_number,
-                "viewers": 0,
-                "cleanup": "scheduled",
-                "timeout_seconds": timeout,
-            }
-
-        return {
-            "status": "ok",
-            "event": "playback.stop",
-            "channel": channel_number,
-            "viewers": viewer_count,
-            "cleanup": "not_needed",
-        }
-
-    def _schedule_cleanup(self, channel_number, timeout, emby_identifier):
-        """Spawn a gevent greenlet to run cleanup after *timeout* seconds."""
-        self._cancel_pending_cleanup(channel_number)
-
-        try:
-            from gevent import spawn, sleep
-
-            now = time.time()
-            _cleanup_metadata[channel_number] = {
-                "scheduled_at": now,
-                "timeout": timeout,
-                "fires_at": now + timeout,
-            }
-
-            def _delayed_cleanup():
-                try:
-                    sleep(timeout)
-                    # Re-check viewer count — someone may have started watching
-                    redis_client = get_redis_client()
-                    if redis_client:
-                        viewer_key = f"{REDIS_KEY_VIEWERS_PREFIX}{channel_number}"
-                        current_viewers = redis_client.scard(viewer_key)
-                        if current_viewers > 0:
-                            logger.info(
-                                f"Cleanup cancelled for channel {channel_number}: "
-                                f"{current_viewers} viewer(s) reconnected during timeout"
-                            )
-                            return
-
-                    self._execute_cleanup(channel_number, emby_identifier)
-                except Exception as e:
-                    logger.error(f"Error in delayed cleanup for channel {channel_number}: {e}", exc_info=True)
-                finally:
-                    _pending_cleanups.pop(channel_number, None)
-                    _cleanup_metadata.pop(channel_number, None)
-
-            greenlet = spawn(_delayed_cleanup)
-            _pending_cleanups[channel_number] = greenlet
-
-        except ImportError:
-            # gevent not available — fall through to synchronous (should not happen
-            # since server.py already imports gevent, but handle gracefully)
-            logger.warning("gevent not available for delayed cleanup, executing immediately")
-            self._execute_cleanup(channel_number, emby_identifier)
-
-    def _cancel_pending_cleanup(self, channel_number):
-        """Cancel a pending cleanup greenlet for the given channel, if any."""
-        greenlet = _pending_cleanups.pop(channel_number, None)
-        _cleanup_metadata.pop(channel_number, None)
-        if greenlet is not None:
+    @staticmethod
+    def _resolve_identifiers(identifiers):
+        """Resolve any hostnames in *identifiers* to IP addresses."""
+        resolved = set()
+        for ident in identifiers:
             try:
-                greenlet.kill(block=False)
-                logger.debug(f"Cancelled pending cleanup for channel {channel_number}")
-            except Exception:
-                pass
-
-    def get_debug_state(self, emby_identifier=""):
-        """Return current tracking state for the debug endpoint.
-
-        Includes Dispatcharr client details and identifier matching info so
-        the debug page can clearly show what would/wouldn't be terminated.
-        """
-        redis_client = get_redis_client()
-        now = time.time()
-
-        channels = {}
-
-        # Resolve emby_identifier hostnames to IPs once
-        identifier_lower = emby_identifier.lower().strip() if emby_identifier else ""
-        resolved_ips = set()
-        if identifier_lower:
-            try:
-                resolved_ips = {
-                    info[4][0]
-                    for info in socket.getaddrinfo(emby_identifier.strip(), None)
-                }
+                for info in socket.getaddrinfo(ident, None):
+                    resolved.add(info[4][0])
             except (socket.gaierror, OSError):
                 pass
+        return resolved
 
-        # Build a map of channel_number -> Channel model info
-        channel_model_cache = {}
+    @staticmethod
+    def _match_client(ip, username, identifiers, resolved_ips):
+        """Check if a client matches any configured identifier.
+        Returns (matched: bool, reason: str)."""
+        if "all" in identifiers:
+            return True, "ALL (matches every client)"
+        ip_lower = ip.lower()
+        uname_lower = username.lower()
+        for ident in identifiers:
+            if ip_lower == ident:
+                return True, f"IP match ({ident})"
+            if uname_lower == ident:
+                return True, f"username match ({ident})"
+        if ip in resolved_ips:
+            return True, "hostname resolves to IP"
+        return False, ""
+
+    # ── Media server session helpers ─────────────────────────────────────────
+
+    def _fetch_media_server_sessions(self):
+        """Fetch active sessions from Emby/Jellyfin.
+
+        Returns a list of session dicts, or ``None`` if not configured.
+        Sets ``self._emby_error`` on failure.
+        """
+        emby_url = (self._settings.get("emby_url") or "").strip().rstrip("/")
+        api_key = (self._settings.get("emby_api_key") or "").strip()
+        if not emby_url or not api_key:
+            return None
+
+        url = f"{emby_url}/Sessions?api_key={api_key}"
         try:
-            from apps.channels.models import Channel
-            channel_model_cache = {
-                str(ch.channel_number): {"name": ch.name, "uuid": str(ch.uuid)}
-                for ch in Channel.objects.only("channel_number", "name", "uuid")
-            }
-        except Exception:
-            pass
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                self._emby_error = None
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            self._emby_error = str(e)
+            logger.warning(f"Failed to fetch media server sessions: {e}")
+            return None
 
-        # Scan Redis for all viewer sets
-        if redis_client:
+    @staticmethod
+    def _count_active_streams(sessions):
+        """Count sessions with an active NowPlayingItem."""
+        if not sessions:
+            return 0
+        return sum(1 for s in sessions if s.get("NowPlayingItem"))
+
+    def _detect_orphans(self, scan_result, emby_active_count, now, ChannelService):
+        """Compare Dispatcharr matched connections against active media server
+        sessions.  Excess connections (oldest by connected_at) are orphans.
+
+        Orphans are confirmed over two consecutive poll cycles before
+        termination to avoid race conditions during channel switches.
+        """
+        # Collect all matched clients across all channels (skip grace channels)
+        all_matched = []
+        for ch_uuid, ch_data in scan_result.items():
+            if ch_data.get("in_grace"):
+                continue
+            for client in ch_data.get("clients", []):
+                if client.get("is_target_match"):
+                    all_matched.append((ch_uuid, ch_data, client))
+
+        total_matched = len(all_matched)
+        if total_matched <= emby_active_count:
+            # No orphans -- clear stale tracking
+            for ch_uuid, _, client in all_matched:
+                self._orphaned_since.pop((ch_uuid, client["client_id"]), None)
+            return
+
+        # More Dispatcharr connections than active media server sessions.
+        num_orphans = total_matched - emby_active_count
+
+        # Sort by connected_at ascending (oldest = most likely orphan)
+        def _connected_sort(item):
             try:
-                prefix = REDIS_KEY_VIEWERS_PREFIX
-                for key in redis_client.scan_iter(match=f"{prefix}*"):
-                    key_str = key.decode('utf-8') if isinstance(key, bytes) else key
-                    channel_number = key_str[len(prefix):]
-                    sessions = redis_client.smembers(key_str)
-                    ttl = redis_client.ttl(key_str)
+                return float(item[2].get("connected_at_raw") or 0)
+            except (ValueError, TypeError):
+                return 0
 
-                    model_info = channel_model_cache.get(channel_number, {})
+        all_matched.sort(key=_connected_sort)
+        orphan_candidates = all_matched[:num_orphans]
+        non_orphans = all_matched[num_orphans:]
 
-                    channels[channel_number] = {
-                        "viewers": len(sessions),
-                        "sessions": sorted(
-                            s.decode('utf-8') if isinstance(s, bytes) else s
-                            for s in sessions
-                        ),
-                        "ttl": ttl if ttl > 0 else None,
-                        "channel_name": model_info.get("name", ""),
-                        "channel_uuid": model_info.get("uuid", ""),
-                        "dispatcharr_clients": [],
-                    }
+        # Clear tracking for non-orphans
+        for ch_uuid, _, client in non_orphans:
+            self._orphaned_since.pop((ch_uuid, client["client_id"]), None)
+
+        poll_interval = max(int(self._settings.get("poll_interval", DEFAULT_POLL_INTERVAL)), 1)
+
+        for ch_uuid, ch_data, client in orphan_candidates:
+            ck = (ch_uuid, client["client_id"])
+            client["is_orphan"] = True
+
+            if ck not in self._orphaned_since:
+                self._orphaned_since[ck] = now
+                logger.info(
+                    f"Potential orphan: client {client['client_id']} on "
+                    f"CH {ch_data.get('channel_number', '?')} "
+                    f"(no matching media server session, connected {client.get('connected_duration', '?')})"
+                )
+                continue
+
+            orphan_age = now - self._orphaned_since[ck]
+            if orphan_age < poll_interval:
+                continue  # not yet confirmed
+
+            channel_number = ch_data.get("channel_number", "?")
+            channel_name = ch_data.get("channel_name", "")
+            logger.info(
+                f"Terminating orphaned client {client['client_id']} on CH "
+                f"{channel_number} ({channel_name}): "
+                f"no active media server session for {orphan_age:.0f}s "
+                f"(ip={client.get('ip', '?')}, user={client.get('username', '?')})"
+            )
+            try:
+                result = ChannelService.stop_client(ch_uuid, client["client_id"])
+                if result.get("status") == "success":
+                    logger.info(f"Successfully terminated orphaned client {client['client_id']}")
+                    self._stopped_log.append({
+                        "time": now,
+                        "channel": f"CH {channel_number} ({channel_name})",
+                        "ip": client.get("ip", ""),
+                        "username": client.get("username", ""),
+                        "idle_seconds": round(client.get("idle_seconds") or 0),
+                        "reason": "orphan",
+                    })
+                    if len(self._stopped_log) > 20:
+                        self._stopped_log = self._stopped_log[-20:]
+                else:
+                    logger.warning(f"stop_client returned: {result}")
             except Exception as e:
-                logger.debug(f"Debug state: error scanning Redis: {e}")
+                logger.error(f"Error stopping orphaned client: {e}", exc_info=True)
+            self._orphaned_since.pop(ck, None)
 
-        # Enrich with Dispatcharr client data for each tracked channel
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def start(self, settings=None):
+        """Start the background polling thread."""
+        if self._running:
+            logger.warning("Stream monitor is already running")
+            return False
+
+        self._settings = settings or {}
+        self._running = True
+        self._idle_since.clear()
+        self._orphaned_since.clear()
+        self._stopped_log.clear()
+        self._emby_active_count = None
+        self._emby_error = None
+
+        # Mark as running in Redis
+        redis_client = get_redis_client()
         if redis_client:
+            redis_client.set(REDIS_KEY_MONITOR, "1")
+            # Clear any stale stop signal
+            redis_client.delete(REDIS_KEY_STOP)
+
+        self._thread = threading.Thread(
+            target=self._poll_loop,
+            daemon=True,
+            name="emby-stream-monitor",
+        )
+        self._thread.start()
+        logger.info("Stream monitor started")
+        return True
+
+    def stop(self):
+        """Stop the background polling thread."""
+        if not self._running:
+            return True
+        self._running = False
+        redis_client = get_redis_client()
+        if redis_client:
+            redis_client.delete(REDIS_KEY_MONITOR)
+        # Thread will exit on next cycle check
+        logger.info("Stream monitor stopping")
+        return True
+
+    def is_running(self):
+        return self._running
+
+    def update_settings(self, settings):
+        """Update settings without restarting."""
+        self._settings = settings or {}
+
+    # ── Poll loop ────────────────────────────────────────────────────────────
+
+    def _poll_loop(self):
+        """Main polling loop. Runs in a daemon thread."""
+        logger.info("Stream monitor poll loop started")
+        while self._running:
             try:
-                from apps.proxy.ts_proxy.redis_keys import RedisKeys
-            except ImportError:
-                RedisKeys = None
+                # Check for Redis stop signal (cross-worker shutdown)
+                redis_client = get_redis_client()
+                if redis_client and read_redis_flag(redis_client, REDIS_KEY_STOP):
+                    logger.info("Stream monitor received stop signal via Redis")
+                    self._running = False
+                    redis_client.delete(REDIS_KEY_MONITOR, REDIS_KEY_STOP)
+                    break
 
-            if RedisKeys:
-                for ch_num, ch_data in channels.items():
-                    uuid = ch_data.get("channel_uuid")
-                    if not uuid:
-                        continue
-                    try:
-                        client_ids = redis_client.smembers(RedisKeys.clients(uuid)) or []
-                        for raw_id in client_ids:
-                            client_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
-                            meta_key = RedisKeys.client_metadata(uuid, client_id)
-                            cdata = redis_client.hgetall(meta_key)
-                            if not cdata:
-                                continue
+                self._poll_once()
+            except Exception as e:
+                logger.error(f"Stream monitor poll error: {e}", exc_info=True)
 
-                            ip = redis_decode(cdata.get(b"ip_address") or cdata.get("ip_address"))
-                            username = redis_decode(cdata.get(b"username") or cdata.get("username"))
-                            user_agent = redis_decode(cdata.get(b"user_agent") or cdata.get("user_agent"))
-                            connected_at = redis_decode(cdata.get(b"connected_at") or cdata.get("connected_at"))
-                            last_active = redis_decode(cdata.get(b"last_active") or cdata.get("last_active"))
-                            bytes_sent = redis_decode(cdata.get(b"bytes_sent") or cdata.get("bytes_sent"))
+            interval = int(self._settings.get("poll_interval", DEFAULT_POLL_INTERVAL))
+            interval = max(1, interval)
+            time.sleep(interval)
 
-                            # Determine if this client matches the emby identifier
-                            is_match = False
-                            match_reason = ""
-                            if identifier_lower:
-                                if ip.lower() == identifier_lower:
-                                    is_match = True
-                                    match_reason = "IP match"
-                                elif username.lower() == identifier_lower:
-                                    is_match = True
-                                    match_reason = "username match"
-                                elif ip in resolved_ips:
-                                    is_match = True
-                                    match_reason = "hostname resolves to IP"
+        logger.info("Stream monitor poll loop exited")
 
-                            # Calculate connected duration
-                            connected_duration = ""
-                            try:
-                                if connected_at:
-                                    dur = now - float(connected_at)
-                                    if dur >= 3600:
-                                        connected_duration = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
-                                    elif dur >= 60:
-                                        connected_duration = f"{int(dur // 60)}m {int(dur % 60)}s"
-                                    else:
-                                        connected_duration = f"{int(dur)}s"
-                            except (ValueError, TypeError):
-                                pass
-
-                            ch_data["dispatcharr_clients"].append({
-                                "client_id": client_id,
-                                "ip": ip,
-                                "username": username,
-                                "user_agent": user_agent,
-                                "connected_duration": connected_duration,
-                                "last_active": last_active,
-                                "bytes_sent": bytes_sent,
-                                "is_emby_match": is_match,
-                                "match_reason": match_reason,
-                            })
-                    except Exception as e:
-                        logger.debug(f"Debug state: error reading clients for channel {ch_num}: {e}")
-
-        # Add pending cleanup info
-        pending = {}
-        for ch, meta in _cleanup_metadata.items():
-            remaining = meta["fires_at"] - now
-            pending[ch] = {
-                "timeout": meta["timeout"],
-                "remaining_seconds": round(max(0, remaining), 1),
-                "scheduled_at": meta["scheduled_at"],
-            }
-            if ch in channels:
-                channels[ch]["cleanup_pending"] = True
-                channels[ch]["cleanup_remaining"] = round(max(0, remaining), 1)
-            else:
-                channels[ch] = {
-                    "viewers": 0,
-                    "sessions": [],
-                    "channel_name": "",
-                    "channel_uuid": "",
-                    "dispatcharr_clients": [],
-                    "cleanup_pending": True,
-                    "cleanup_remaining": round(max(0, remaining), 1),
-                }
-
-        return {
-            "channels": channels,
-            "pending_cleanups": pending,
-            "identifier_configured": bool(identifier_lower),
-            "resolved_ips": sorted(resolved_ips) if resolved_ips else [],
-        }
-
-    def _execute_cleanup(self, channel_number, emby_identifier):
-        """Terminate Dispatcharr client connections for Emby on the given channel."""
-        try:
-            from apps.channels.models import Channel
-
-            try:
-                channel = Channel.objects.get(channel_number=float(channel_number))
-            except Channel.DoesNotExist:
-                logger.warning(f"Cleanup: channel number {channel_number} not found in Dispatcharr")
-                return
-            except (ValueError, Channel.MultipleObjectsReturned) as e:
-                logger.warning(f"Cleanup: error looking up channel {channel_number}: {e}")
-                return
-
-            channel_uuid = str(channel.uuid)
-            self._stop_matching_clients(channel_uuid, channel_number, emby_identifier)
-
-        except ImportError:
-            logger.error("Cannot import Dispatcharr models — is the plugin running inside Dispatcharr?")
-
-    def _stop_matching_clients(self, channel_uuid, channel_number, emby_identifier):
-        """Find and stop Dispatcharr clients matching the Emby identifier."""
+    def _poll_once(self):
+        """Single poll cycle: scan channels, check idle matched clients, terminate."""
         redis_client = get_redis_client()
         if not redis_client:
-            logger.error("Cleanup: Redis unavailable, cannot stop clients")
             return
+
+        client_identifier = (self._settings.get("client_identifier") or "").strip()
+        if not client_identifier:
+            return
+
+        identifiers = self._parse_identifiers(client_identifier)
+        if not identifiers:
+            return
+
+        resolved_ips = self._resolve_identifiers(identifiers)
+        timeout = int(self._settings.get("cleanup_timeout", DEFAULT_CLEANUP_TIMEOUT))
+        now = time.time()
+
+        # Read Dispatcharr proxy settings for failover grace period
+        failover_grace = _get_failover_grace()
 
         try:
             from apps.proxy.ts_proxy.redis_keys import RedisKeys
             from apps.proxy.ts_proxy.services.channel_service import ChannelService
         except ImportError:
-            logger.error("Cannot import Dispatcharr proxy modules")
             return
 
-        client_set_key = RedisKeys.clients(channel_uuid)
-        client_ids = redis_client.smembers(client_set_key) or []
+        # Build channel model cache for names
+        channel_model_cache = {}
+        try:
+            from apps.channels.models import Channel
+            for ch in Channel.objects.only("channel_number", "name", "uuid"):
+                channel_model_cache[str(ch.uuid)] = {
+                    "name": ch.name,
+                    "number": str(int(ch.channel_number)) if ch.channel_number == int(ch.channel_number) else str(ch.channel_number),
+                }
+        except Exception:
+            pass
 
-        if not client_ids:
-            logger.debug(f"Cleanup: no active clients on channel {channel_number} ({channel_uuid})")
-            return
+        # Find all active channels by scanning channel_stream:* keys
+        scan_result = {}
+        active_keys = set()
 
-        stopped_count = 0
-        for raw_id in client_ids:
-            client_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
-            meta_key = RedisKeys.client_metadata(channel_uuid, client_id)
-            client_data = redis_client.hgetall(meta_key)
+        try:
+            for key in redis_client.scan_iter(match="channel_stream:*"):
+                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                # key format: channel_stream:{channel_id}
+                parts = key_str.split(":", 1)
+                if len(parts) < 2:
+                    continue
+                channel_id_raw = parts[1]
 
-            if not client_data:
-                continue
+                # channel_id_raw might be numeric ID, need to find UUID
+                # Look up UUID from channel model cache by checking all channels
+                channel_uuid = None
+                channel_name = ""
+                channel_number = ""
 
-            ip_address = redis_decode(client_data.get(b"ip_address") or client_data.get("ip_address"))
-            username = redis_decode(client_data.get(b"username") or client_data.get("username"))
-            user_agent = redis_decode(client_data.get(b"user_agent") or client_data.get("user_agent"))
-
-            # Match against emby_identifier (check IP, resolved IP, and username)
-            identifier_lower = emby_identifier.lower()
-            match = (
-                ip_address.lower() == identifier_lower
-                or username.lower() == identifier_lower
-            )
-            # If identifier looks like a hostname (not purely an IP), resolve it
-            if not match:
-                try:
-                    resolved_ips = {
-                        info[4][0]
-                        for info in socket.getaddrinfo(emby_identifier, None)
-                    }
-                    match = ip_address in resolved_ips
-                except (socket.gaierror, OSError):
-                    pass
-            if not match:
-                continue
-
-            logger.info(
-                f"Cleanup: stopping client {client_id} on channel {channel_number} "
-                f"(ip={ip_address}, user={username}, ua={user_agent})"
-            )
-
-            try:
-                result = ChannelService.stop_client(channel_uuid, client_id)
-                if result.get("status") == "success":
-                    stopped_count += 1
-                    logger.info(f"Cleanup: successfully stopped client {client_id}")
+                # Try treating channel_id_raw as a UUID directly
+                if channel_id_raw in channel_model_cache:
+                    channel_uuid = channel_id_raw
+                    channel_name = channel_model_cache[channel_id_raw]["name"]
+                    channel_number = channel_model_cache[channel_id_raw]["number"]
                 else:
-                    logger.warning(f"Cleanup: stop_client returned: {result}")
-            except Exception as e:
-                logger.error(f"Cleanup: error stopping client {client_id}: {e}", exc_info=True)
+                    # It's a numeric ID; look up the channel
+                    try:
+                        ch = Channel.objects.filter(pk=int(channel_id_raw)).only("uuid", "name", "channel_number").first()
+                        if ch:
+                            channel_uuid = str(ch.uuid)
+                            channel_name = ch.name
+                            channel_number = str(int(ch.channel_number)) if ch.channel_number == int(ch.channel_number) else str(ch.channel_number)
+                    except (ValueError, Exception):
+                        pass
 
-        if stopped_count > 0:
-            logger.info(
-                f"Cleanup complete: stopped {stopped_count} Emby client(s) on channel {channel_number}"
-            )
+                if not channel_uuid:
+                    continue
+
+                # ── Failover / buffering protection ──────────────────────────
+                # Read channel metadata to check if the stream is mid-failover
+                # or still buffering.  Clients appear idle during these states
+                # because no data is flowing, so we must not terminate them.
+                ch_meta_key = RedisKeys.channel_metadata(channel_uuid)
+                ch_meta = redis_client.hgetall(ch_meta_key) or {}
+                ch_state = redis_decode(
+                    ch_meta.get(b"state") or ch_meta.get("state")
+                ).lower()
+                in_grace = ch_state in _GRACE_STATES
+
+                if not in_grace:
+                    # Even if state is "active", a recent stream switch means
+                    # data may have just resumed and last_active hasn't caught up.
+                    switch_raw = redis_decode(
+                        ch_meta.get(b"stream_switch_time") or ch_meta.get("stream_switch_time")
+                    )
+                    try:
+                        switch_ts = float(switch_raw) if switch_raw else 0
+                    except (ValueError, TypeError):
+                        switch_ts = 0
+                    if switch_ts and (now - switch_ts) < failover_grace:
+                        in_grace = True
+
+                # Read clients for this channel
+                client_ids = redis_client.smembers(RedisKeys.clients(channel_uuid)) or []
+                if not client_ids:
+                    continue
+
+                channel_clients = []
+                for raw_id in client_ids:
+                    client_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+                    meta_key = RedisKeys.client_metadata(channel_uuid, client_id)
+                    cdata = redis_client.hgetall(meta_key)
+                    if not cdata:
+                        continue
+
+                    ip = redis_decode(cdata.get(b"ip_address") or cdata.get("ip_address"))
+                    username = redis_decode(cdata.get(b"username") or cdata.get("username"))
+                    user_agent = redis_decode(cdata.get(b"user_agent") or cdata.get("user_agent"))
+                    connected_at = redis_decode(cdata.get(b"connected_at") or cdata.get("connected_at"))
+                    last_active_raw = redis_decode(cdata.get(b"last_active") or cdata.get("last_active"))
+                    bytes_sent = redis_decode(cdata.get(b"bytes_sent") or cdata.get("bytes_sent"))
+
+                    matched, match_reason = self._match_client(ip, username, identifiers, resolved_ips)
+
+                    # Calculate last_active age
+                    try:
+                        last_active_ts = float(last_active_raw) if last_active_raw else 0
+                    except (ValueError, TypeError):
+                        last_active_ts = 0
+                    idle_seconds = (now - last_active_ts) if last_active_ts > 0 else None
+
+                    # Calculate connected duration
+                    connected_duration = ""
+                    try:
+                        if connected_at:
+                            dur = now - float(connected_at)
+                            if dur >= 3600:
+                                connected_duration = f"{int(dur // 3600)}h {int((dur % 3600) // 60)}m"
+                            elif dur >= 60:
+                                connected_duration = f"{int(dur // 60)}m {int(dur % 60)}s"
+                            else:
+                                connected_duration = f"{int(dur)}s"
+                    except (ValueError, TypeError):
+                        pass
+
+                    client_info = {
+                        "client_id": client_id,
+                        "ip": ip,
+                        "username": username,
+                        "user_agent": user_agent,
+                        "connected_at_raw": connected_at,
+                        "connected_duration": connected_duration,
+                        "bytes_sent": bytes_sent,
+                        "is_target_match": matched,
+                        "match_reason": match_reason,
+                        "idle_seconds": round(idle_seconds, 1) if idle_seconds is not None else None,
+                        "in_grace": in_grace,
+                        "is_orphan": False,
+                    }
+                    channel_clients.append(client_info)
+
+                    # Track and act on idle matched clients
+                    if matched and idle_seconds is not None:
+                        ck = (channel_uuid, client_id)
+                        active_keys.add(ck)
+
+                        if idle_seconds >= timeout and not in_grace:
+                            # Client has been idle long enough and channel is
+                            # not mid-failover -- safe to terminate.
+                            logger.info(
+                                f"Terminating idle client {client_id} on CH {channel_number} "
+                                f"({channel_name}): idle {idle_seconds:.0f}s >= {timeout}s timeout "
+                                f"(ip={ip}, user={username})"
+                            )
+                            try:
+                                result = ChannelService.stop_client(channel_uuid, client_id)
+                                if result.get("status") == "success":
+                                    logger.info(f"Successfully terminated client {client_id}")
+                                    self._stopped_log.append({
+                                        "time": now,
+                                        "channel": f"CH {channel_number} ({channel_name})",
+                                        "ip": ip,
+                                        "username": username,
+                                        "idle_seconds": round(idle_seconds),
+                                    })
+                                    # Keep log manageable
+                                    if len(self._stopped_log) > 20:
+                                        self._stopped_log = self._stopped_log[-20:]
+                                else:
+                                    logger.warning(f"stop_client returned: {result}")
+                            except Exception as e:
+                                logger.error(f"Error stopping client {client_id}: {e}", exc_info=True)
+                            self._idle_since.pop(ck, None)
+                        else:
+                            # Track when we first noticed this client idle
+                            if ck not in self._idle_since:
+                                self._idle_since[ck] = now
+                    elif matched:
+                        # Active, clear idle tracking
+                        ck = (channel_uuid, client_id)
+                        active_keys.add(ck)
+                        self._idle_since.pop(ck, None)
+
+                if channel_clients:
+                    scan_result[channel_uuid] = {
+                        "channel_name": channel_name,
+                        "channel_number": channel_number,
+                        "channel_state": ch_state,
+                        "in_grace": in_grace,
+                        "clients": channel_clients,
+                    }
+
+        except Exception as e:
+            logger.error(f"Error during poll scan: {e}", exc_info=True)
+
+        # Prune idle_since entries for clients that disappeared
+        stale = [k for k in self._idle_since if k not in active_keys]
+        for k in stale:
+            self._idle_since.pop(k, None)
+
+        # ── Media server orphan detection ────────────────────────────────
+        sessions = self._fetch_media_server_sessions()
+        if sessions is not None:
+            emby_active = self._count_active_streams(sessions)
+            self._emby_active_count = emby_active
+            self._detect_orphans(scan_result, emby_active, now, ChannelService)
+        elif (self._settings.get("emby_url") or "").strip():
+            # Configured but fetch failed -- keep last count, don't orphan-kill
+            pass
         else:
-            logger.debug(
-                f"Cleanup: no matching Emby clients found on channel {channel_number} "
-                f"for identifier '{emby_identifier}'"
-            )
+            self._emby_active_count = None
+
+        # Prune orphaned_since entries for clients that disappeared
+        stale_orphans = [k for k in self._orphaned_since if k not in active_keys]
+        for k in stale_orphans:
+            self._orphaned_since.pop(k, None)
+
+        self._last_scan = scan_result
+        self._last_scan_time = now
+
+    # ── Debug state ──────────────────────────────────────────────────────────
+
+    def get_debug_state(self):
+        """Return current state for the debug page."""
+        client_identifier = (self._settings.get("client_identifier") or "").strip()
+        identifiers = self._parse_identifiers(client_identifier)
+        resolved_ips = self._resolve_identifiers(identifiers)
+        timeout = int(self._settings.get("cleanup_timeout", DEFAULT_CLEANUP_TIMEOUT))
+        poll_interval = int(self._settings.get("poll_interval", DEFAULT_POLL_INTERVAL))
+
+        return {
+            "running": self._running,
+            "scan": self._last_scan,
+            "scan_time": self._last_scan_time,
+            "idle_timeout": timeout,
+            "poll_interval": poll_interval,
+            "identifier_configured": bool(identifiers),
+            "resolved_ips": sorted(resolved_ips) if resolved_ips else [],
+            "stopped_log": list(self._stopped_log),
+            "emby_configured": bool((self._settings.get("emby_url") or "").strip()),
+            "emby_active_count": self._emby_active_count,
+            "emby_error": self._emby_error,
+        }

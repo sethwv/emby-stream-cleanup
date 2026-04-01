@@ -1,7 +1,7 @@
 {
   "name": "Emby Stream Cleanup",
-  "version": "-dev-00000000-20260401141159",
-  "description": "Automatically terminate orphaned Dispatcharr connections when Emby users stop watching",
+  "version": "-dev-073e41c9-20260401153654",
+  "description": "Monitors Dispatcharr client activity and terminates idle Emby connections",
   "license": "MIT",
   "author": "sethwv",
   "min_dispatcharr_version": "v0.22.0",

@@ -1,12 +1,15 @@
-"""gevent WSGI webhook server.
+"""Debug HTTP server (optional).
 
-Binds to a configurable host:port and serves:
-  GET  /          Landing page with webhook URL info
-  POST /webhook   Receive Emby webhook payloads
-  GET  /health    Simple health check
+Serves a debug dashboard showing which Dispatcharr clients match the
+configured identifier and their idle status.  The stream monitor runs
+independently in a background thread.
+
+Routes:
+  GET  /        Landing page
+  GET  /debug   Live debug dashboard (auto-refreshes)
+  GET  /health  Health check
 """
 
-import json
 import logging
 import socket
 import threading
@@ -16,42 +19,39 @@ from .config import (
     PLUGIN_CONFIG, REDIS_KEY_RUNNING, REDIS_KEY_HOST, REDIS_KEY_PORT,
     REDIS_KEY_STOP, DEFAULT_PORT, DEFAULT_HOST,
 )
-from .utils import get_redis_client, read_redis_flag, normalize_host, get_dispatcharr_version, compare_versions
+from .utils import get_redis_client, read_redis_flag, normalize_host
 
 logger = logging.getLogger(__name__)
 
 # Module-level reference to the currently running server instance (per process).
-_webhook_server = None
-
-# Store the last raw webhook received on /debug/webhook for inspection.
-_last_debug_webhook = None
+_debug_server = None
 
 
 def get_current_server():
-    """Return the active WebhookServer instance for this process, or None."""
-    return _webhook_server
+    """Return the active DebugServer instance for this process, or None."""
+    return _debug_server
 
 
 def set_current_server(server):
-    """Set the active WebhookServer instance for this process."""
-    global _webhook_server
-    _webhook_server = server
+    """Set the active DebugServer instance for this process."""
+    global _debug_server
+    _debug_server = server
 
 
-class WebhookServer:
-    """Lightweight gevent WSGI server that receives Emby webhooks."""
+class DebugServer:
+    """Lightweight gevent WSGI server for the debug dashboard."""
 
-    def __init__(self, handler, port=None, host=None):
-        self.handler = handler
+    def __init__(self, monitor, port=None, host=None):
+        self.monitor = monitor
         self.port = port if port is not None else DEFAULT_PORT
         self.host = normalize_host(host, DEFAULT_HOST)
-        logger.info(f"WebhookServer initialised with host='{self.host}', port={self.port}")
+        logger.info(f"DebugServer initialised with host='{self.host}', port={self.port}")
         self.server_thread = None
         self.server = None
         self.running = False
         self.settings = {}
 
-    # ── Port verification ────────────────────────────────────────────────────
+    # -- Port verification ----------------------------------------------------
 
     def _verify_stopped(self, timeout=3):
         """Block until the server port is confirmed free (up to *timeout* seconds)."""
@@ -77,228 +77,182 @@ class WebhookServer:
         )
         return False
 
-    # ── WSGI application ─────────────────────────────────────────────────────
+    # -- WSGI application -----------------------------------------------------
 
     def wsgi_app(self, environ, start_response):
         """Handle a single HTTP request."""
         path = environ.get('PATH_INFO', '/')
-        method = environ.get('REQUEST_METHOD', 'GET')
 
-        if path == '/webhook':
-            if method != 'POST':
-                start_response('405 Method Not Allowed', [
-                    ('Content-Type', 'text/plain'),
-                    ('Allow', 'POST'),
-                ])
-                return [b"Method Not Allowed. Use POST.\n"]
-
-            try:
-                content_length = int(environ.get('CONTENT_LENGTH', 0) or 0)
-                if content_length == 0:
-                    start_response('400 Bad Request', [('Content-Type', 'application/json')])
-                    return [json.dumps({"error": "Empty request body"}).encode('utf-8')]
-
-                body = environ['wsgi.input'].read(content_length)
-                event_data = json.loads(body)
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Invalid JSON in webhook request: {e}")
-                start_response('400 Bad Request', [('Content-Type', 'application/json')])
-                return [json.dumps({"error": "Invalid JSON"}).encode('utf-8')]
-
-            try:
-                result = self.handler.handle_webhook(event_data, self.settings)
-                start_response('200 OK', [('Content-Type', 'application/json')])
-                return [json.dumps(result).encode('utf-8')]
-            except Exception as e:
-                logger.error(f"Error processing webhook: {e}", exc_info=True)
-                start_response('500 Internal Server Error', [('Content-Type', 'application/json')])
-                return [json.dumps({"error": "Internal server error"}).encode('utf-8')]
-
-        elif path == '/health':
+        if path == '/health':
             start_response('200 OK', [('Content-Type', 'text/plain')])
             return [b"OK\n"]
 
-        elif path == '/debug/webhook':
-            global _last_debug_webhook
-            if method == 'POST':
-                try:
-                    content_length = int(environ.get('CONTENT_LENGTH', 0) or 0)
-                    body = environ['wsgi.input'].read(content_length) if content_length else b''
-                    payload = json.loads(body) if body else {}
-                    import time as _t
-                    _last_debug_webhook = {
-                        "received_at": _t.time(),
-                        "payload": payload,
-                    }
-                    logger.debug(f"Debug webhook received: {payload.get('Event', 'unknown')}")
-                    start_response('200 OK', [('Content-Type', 'application/json')])
-                    return [json.dumps({"status": "received"}).encode('utf-8')]
-                except (json.JSONDecodeError, ValueError):
-                    start_response('400 Bad Request', [('Content-Type', 'application/json')])
-                    return [json.dumps({"error": "Invalid JSON"}).encode('utf-8')]
+        elif path == '/debug':
+            return self._serve_debug_page(start_response)
 
-            # GET — show last received webhook
-            import time as _time
+        elif path == '/':
+            return self._serve_landing_page(start_response)
+
+        else:
+            start_response('404 Not Found', [('Content-Type', 'text/plain')])
+            return [b"Not Found\n"]
+
+    # -- Debug page ------------------------------------------------------------
+
+    def _serve_debug_page(self, start_response):
+        try:
+            debug_state = self.monitor.get_debug_state()
+            now = time.time()
+
             plugin_name = PLUGIN_CONFIG.get('name', 'Emby Stream Cleanup')
-            if _last_debug_webhook:
-                ts = _last_debug_webhook["received_at"]
-                ago = _time.time() - ts
-                from datetime import datetime, timezone
-                ts_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                payload_json = json.dumps(_last_debug_webhook["payload"], indent=2)
-                # Escape HTML
-                payload_html = payload_json.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                content_html = f'''<div class="meta">Received: {ts_str} ({int(ago)}s ago)</div>
-                    <pre>{payload_html}</pre>'''
-            else:
-                content_html = '<div class="empty">No webhook received yet. POST any JSON to this URL.</div>'
+            identifier = self.settings.get("client_identifier", "") or ""
+            identifier_display = identifier or "(not set)"
+            timeout = debug_state.get("idle_timeout", 30)
+            poll_interval = debug_state.get("poll_interval", 10)
+            monitor_running = debug_state.get("running", False)
 
-            html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>{plugin_name} - Debug Webhook</title>
-    <meta http-equiv="refresh" content="5">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-            max-width: 800px;
-            margin: 40px auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        .container {{
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        h1 {{ margin-top: 0; color: #333; font-size: 22px; }}
-        .nav {{ margin-bottom: 20px; font-size: 13px; }}
-        a {{ color: #0066cc; text-decoration: none; }}
-        .meta {{ font-size: 13px; color: #888; margin-bottom: 10px; }}
-        pre {{
-            background: #f8f8f8;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            padding: 16px;
-            font-size: 12px;
-            overflow-x: auto;
-            max-height: 600px;
-            overflow-y: auto;
-        }}
-        .empty {{ color: #999; font-style: italic; padding: 20px 0; text-align: center; }}
-        .webhook-url {{
-            background: #e3f2fd;
-            padding: 10px 15px;
-            border-radius: 4px;
-            font-family: monospace;
-            font-size: 13px;
-            margin: 10px 0 15px;
-        }}
-        .refresh-note {{ font-size: 11px; color: #bbb; text-align: center; margin-top: 15px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav"><a href="/">&larr; Home</a> &nbsp;|&nbsp; <a href="/debug">Debug</a></div>
-        <h1>Debug Webhook</h1>
-        <p style="color:#666; font-size: 14px;">Point any webhook here to inspect the payload:</p>
-        <div class="webhook-url">POST http://&lt;host&gt;:{self.port}/debug/webhook</div>
-        {content_html}
-        <div class="refresh-note">Auto-refreshes every 5 seconds</div>
-    </div>
-</body>
-</html>"""
+            # Resolved IPs info
+            resolved_ips = debug_state.get("resolved_ips", [])
+            resolved_html = ""
+            if resolved_ips and identifier:
+                resolved_html = f' &rarr; <span>{", ".join(resolved_ips)}</span>'
+
+            # Monitor status
+            if monitor_running:
+                monitor_badge = '<span class="badge active">Running</span>'
+            else:
+                monitor_badge = '<span class="badge idle">Stopped</span>'
+
+            # Media server status
+            emby_configured = debug_state.get("emby_configured", False)
+            emby_active_count = debug_state.get("emby_active_count")
+            emby_error = debug_state.get("emby_error")
+            emby_html = ""
+            if emby_configured:
+                if emby_error:
+                    emby_html = f'<tr><td>Media Server</td><td><span class="warn">Error: {emby_error}</span></td></tr>'
+                elif emby_active_count is not None:
+                    emby_html = f'<tr><td>Media Server</td><td><span>{emby_active_count} active session(s)</span></td></tr>'
+                else:
+                    emby_html = '<tr><td>Media Server</td><td><span>Connecting...</span></td></tr>'
+
+            # Build channel cards from last scan
+            scan = debug_state.get("scan", {})
+            channels_html = ""
+            if scan:
+                for ch_uuid, ch_data in sorted(scan.items(), key=lambda x: x[1].get("channel_number", "")):
+                    channel_name = ch_data.get("channel_name", "")
+                    channel_number = ch_data.get("channel_number", "?")
+                    ch_in_grace = ch_data.get("in_grace", False)
+                    ch_state = ch_data.get("channel_state", "")
+                    clients = ch_data.get("clients", [])
+
+                    matched_clients = [c for c in clients if c.get("is_target_match")]
+                    other_clients = [c for c in clients if not c.get("is_target_match")]
+
+                    # Determine card status based on idle state of matched clients
+                    has_idle = any(
+                        (c.get("idle_seconds") or 0) >= timeout
+                        for c in matched_clients
+                    )
+
+                    if ch_in_grace:
+                        status_class = "grace"
+                        status_label = f"Grace period ({ch_state})"
+                        status_desc = "Channel is buffering or switching streams &mdash; terminations paused"
+                    elif has_idle:
+                        status_class = "pending"
+                        status_label = "Idle matched clients detected"
+                        status_desc = "Matching clients will be terminated when idle timeout expires"
+                    elif matched_clients:
+                        status_class = "active"
+                        status_label = f"{len(matched_clients)} matched client(s) active"
+                        status_desc = "Clients are streaming data normally"
+                    else:
+                        status_class = "idle"
+                        status_label = "No matched clients"
+                        status_desc = "No clients on this channel match the configured identifier"
+
+                    name_html = f' <span class="channel-name">{channel_name}</span>' if channel_name else ""
+                    card_html = f'''
+                    <div class="card {status_class}">
+                        <div class="card-header">
+                            <span class="channel-num">CH {channel_number}{name_html}</span>
+                            <span class="badge {status_class}">{status_label}</span>
+                        </div>
+                        <div class="status-desc">{status_desc}</div>'''
+
+                    if matched_clients:
+                        card_html += f'<div class="section-label target">Matched Clients ({len(matched_clients)})</div>'
+                        if ch_in_grace:
+                            card_html += '<div class="client-note grace-note">Terminations PAUSED during failover/buffering</div>'
+                        else:
+                            card_html += '<div class="client-note target-note">Idle clients WILL be terminated after timeout</div>'
+                        for c in matched_clients:
+                            card_html += self._render_client_row(c, is_match=True, timeout=timeout)
+
+                    if other_clients:
+                        card_html += f'<div class="section-label safe">Other Clients ({len(other_clients)})</div>'
+                        card_html += '<div class="client-note safe-note">These connections will NOT be affected</div>'
+                        for c in other_clients:
+                            card_html += self._render_client_row(c, is_match=False, timeout=timeout)
+
+                    card_html += '</div>'
+                    channels_html += card_html
+            else:
+                channels_html = '<div class="empty">No active channels with clients found.</div>'
+
+            # Recent terminations
+            stopped_log = debug_state.get("stopped_log", [])
+            log_html = ""
+            if stopped_log:
+                log_html = '<h2>Recent Terminations</h2>'
+                for entry in reversed(stopped_log):
+                    from datetime import datetime, timezone
+                    ts = entry.get("time", 0)
+                    ts_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S UTC')
+                    ago = int(now - ts)
+                    reason = entry.get("reason", "idle")
+                    reason_label = '<span class="orphan-warn">[ORPHAN]</span> ' if reason == "orphan" else ""
+                    log_html += (
+                        f'<div class="log-entry">'
+                        f'<span class="log-time">{ts_str} ({ago}s ago)</span> '
+                        f'{reason_label}'
+                        f'{entry.get("channel", "?")} '
+                        f'<span class="log-detail">ip={entry.get("ip", "?")} '
+                        f'user={entry.get("username", "?")} '
+                        f'idle={entry.get("idle_seconds", "?")}s</span>'
+                        f'</div>'
+                    )
+
+            # Last scan time
+            scan_time = debug_state.get("scan_time", 0)
+            scan_ago = f"{int(now - scan_time)}s ago" if scan_time > 0 else "never"
+
+            refresh_interval = min(poll_interval, 5)
+
+            html = self._debug_html(
+                plugin_name, monitor_badge, identifier_display, resolved_html,
+                timeout, poll_interval, scan_ago, channels_html, log_html,
+                refresh_interval, emby_html
+            )
+
             start_response('200 OK', [('Content-Type', 'text/html; charset=utf-8')])
             return [html.encode('utf-8')]
+        except Exception as e:
+            logger.error(f"Error generating debug page: {e}", exc_info=True)
+            start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
+            return [b"Error generating debug page\n"]
 
-        elif path == '/debug':
-            try:
-                identifier = self.settings.get("emby_identifier", "") or ""
-                timeout = self.settings.get("cleanup_timeout", 30)
-                debug_state = self.handler.get_debug_state(emby_identifier=identifier)
-
-                import time as _time
-                now = _time.time()
-
-                plugin_name = PLUGIN_CONFIG.get('name', 'Emby Stream Cleanup')
-                identifier_display = identifier or "(not set)"
-
-                # Resolved IPs info
-                resolved_ips = debug_state.get("resolved_ips", [])
-                resolved_html = ""
-                if resolved_ips and identifier:
-                    resolved_html = f' &rarr; <span>{", ".join(resolved_ips)}</span>'
-
-                # Build channel cards
-                channels_html = ""
-                if debug_state.get("channels"):
-                    for ch_num, ch_data in sorted(debug_state["channels"].items(), key=lambda x: x[0]):
-                        viewers = ch_data.get("viewers", 0)
-                        sessions = ch_data.get("sessions", [])
-                        cleanup_pending = ch_data.get("cleanup_pending", False)
-                        cleanup_remaining = ch_data.get("cleanup_remaining")
-                        channel_name = ch_data.get("channel_name", "")
-                        clients = ch_data.get("dispatcharr_clients", [])
-
-                        # Status determination
-                        status_class = "active" if viewers > 0 else ("pending" if cleanup_pending else "idle")
-
-                        if viewers > 0:
-                            status_label = f"{viewers} Emby viewer(s) watching"
-                            status_desc = "Cleanup will NOT run while viewers are active"
-                        elif cleanup_pending:
-                            status_label = f"Cleanup in {cleanup_remaining}s"
-                            status_desc = "Last Emby viewer stopped — countdown to terminate matching clients"
-                        else:
-                            status_label = "Idle"
-                            status_desc = "No active Emby viewers tracked"
-
-                        # Channel header
-                        name_html = f' <span class="channel-name">{channel_name}</span>' if channel_name else ""
-                        card_html = f'''
-                        <div class="card {status_class}">
-                            <div class="card-header">
-                                <span class="channel-num">CH {ch_num}{name_html}</span>
-                                <span class="badge {status_class}">{status_label}</span>
-                            </div>
-                            <div class="status-desc">{status_desc}</div>'''
-
-                        # Emby sessions
-                        if sessions:
-                            card_html += '<div class="section-label">Emby PlaySessionIds</div>'
-                            for s in sessions:
-                                card_html += f'<div class="session">{s}</div>'
-
-                        # Dispatcharr clients
-                        if clients:
-                            emby_clients = [c for c in clients if c.get("is_emby_match")]
-                            other_clients = [c for c in clients if not c.get("is_emby_match")]
-
-                            if emby_clients:
-                                card_html += f'<div class="section-label target">Dispatcharr Clients Matching Identifier ({len(emby_clients)})</div>'
-                                card_html += '<div class="client-note target-note">These connections WILL be terminated when cleanup fires</div>'
-                                for c in emby_clients:
-                                    card_html += self._render_client_row(c, is_match=True)
-
-                            if other_clients:
-                                card_html += f'<div class="section-label safe">Other Dispatcharr Clients ({len(other_clients)})</div>'
-                                card_html += '<div class="client-note safe-note">These connections will NOT be affected</div>'
-                                for c in other_clients:
-                                    card_html += self._render_client_row(c, is_match=False)
-                        elif ch_data.get("channel_uuid"):
-                            card_html += '<div class="no-clients">No active Dispatcharr clients on this channel</div>'
-
-                        card_html += '</div>'
-                        channels_html += card_html
-                else:
-                    channels_html = '<div class="empty">No channels being tracked — waiting for Emby webhook events</div>'
-
-                html = f"""<!DOCTYPE html>
+    @staticmethod
+    def _debug_html(plugin_name, monitor_badge, identifier_display, resolved_html,
+                    timeout, poll_interval, scan_ago, channels_html, log_html,
+                    refresh_interval, emby_html):
+        return f"""<!DOCTYPE html>
 <html>
 <head>
     <title>{plugin_name} - Debug</title>
-    <meta http-equiv="refresh" content="5">
+    <meta http-equiv="refresh" content="{refresh_interval}">
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -317,12 +271,10 @@ class WebhookServer:
         h2 {{ color: #555; font-size: 16px; margin-top: 25px; border-bottom: 1px solid #eee; padding-bottom: 8px; }}
         .nav {{ margin-bottom: 20px; font-size: 13px; }}
         a {{ color: #0066cc; text-decoration: none; }}
-
         .config-table {{ font-size: 13px; color: #666; margin-bottom: 20px; width: 100%; }}
         .config-table td {{ padding: 3px 0; }}
         .config-table td:first-child {{ color: #999; width: 140px; }}
         .config-table span {{ color: #333; font-weight: 500; }}
-
         .explainer {{
             background: #f0f7ff;
             border: 1px solid #d0e3f7;
@@ -334,7 +286,6 @@ class WebhookServer:
             line-height: 1.6;
         }}
         .explainer strong {{ color: #1a365d; }}
-
         .card {{
             border: 1px solid #e0e0e0;
             border-radius: 6px;
@@ -362,7 +313,9 @@ class WebhookServer:
         .badge.active {{ background: #e8f5e9; color: #2e7d32; }}
         .badge.pending {{ background: #fff3e0; color: #e65100; }}
         .badge.idle {{ background: #f5f5f5; color: #757575; }}
-
+        .badge.grace {{ background: #e3f2fd; color: #1565c0; }}
+        .card.grace {{ border-left: 4px solid #42a5f5; }}
+        .grace-note {{ color: #1565c0; }}
         .section-label {{
             font-size: 11px;
             font-weight: 600;
@@ -375,7 +328,6 @@ class WebhookServer:
         }}
         .section-label.target {{ color: #e65100; }}
         .section-label.safe {{ color: #2e7d32; }}
-
         .client-note {{
             font-size: 11px;
             font-style: italic;
@@ -383,14 +335,6 @@ class WebhookServer:
         }}
         .target-note {{ color: #e65100; }}
         .safe-note {{ color: #388e3c; }}
-
-        .session {{
-            font-family: monospace;
-            font-size: 12px;
-            color: #666;
-            padding: 2px 0;
-        }}
-
         .client-row {{
             font-size: 12px;
             padding: 6px 10px;
@@ -429,59 +373,68 @@ class WebhookServer:
             color: #388e3c;
             font-weight: 500;
         }}
-
-        .no-clients {{
-            font-size: 12px;
-            color: #bbb;
-            font-style: italic;
-            margin-top: 10px;
-            padding-top: 10px;
-            border-top: 1px solid #f0f0f0;
+        .idle-warn {{
+            color: #e65100;
+            font-weight: 600;
         }}
-
+        .orphan-warn {{
+            color: #b71c1c;
+            font-weight: 600;
+        }}
         .empty {{ color: #999; font-style: italic; padding: 20px 0; text-align: center; }}
         .refresh-note {{ font-size: 11px; color: #bbb; text-align: center; margin-top: 15px; }}
         .warn {{ color: #e65100; font-weight: 500; }}
+        .log-entry {{
+            font-size: 12px;
+            padding: 4px 0;
+            border-bottom: 1px solid #f5f5f5;
+        }}
+        .log-time {{ color: #999; font-size: 11px; }}
+        .log-detail {{ color: #666; font-family: monospace; font-size: 11px; }}
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="nav"><a href="/">&larr; Home</a> &nbsp;|&nbsp; <a href="/debug/webhook">Webhook Inspector</a></div>
-        <h1>Debug</h1>
+        <div class="nav"><a href="/">&larr; Home</a></div>
+        <h1>Debug {monitor_badge}</h1>
 
         <table class="config-table">
-            <tr><td>Emby Identifier</td><td><span>{identifier_display}</span>{resolved_html}</td></tr>
-            <tr><td>Cleanup Timeout</td><td><span>{timeout}s</span></td></tr>
+            <tr><td>Client Identifier</td><td><span>{identifier_display}</span>{resolved_html}</td></tr>
+            <tr><td>Idle Timeout</td><td><span>{timeout}s</span></td></tr>
+            <tr><td>Poll Interval</td><td><span>{poll_interval}s</span></td></tr>
+            <tr><td>Last Scan</td><td><span>{scan_ago}</span></td></tr>
+            {emby_html}
         </table>
 
         <div class="explainer">
-            <strong>How cleanup works:</strong>
-            When all Emby viewers stop watching a channel, a <strong>{timeout}s countdown</strong> starts.
-            If no Emby viewer reconnects before it expires, only Dispatcharr clients
-            matching the identifier <strong>{identifier_display}</strong> are terminated.
+            <strong>How it works:</strong>
+            The monitor polls all active Dispatcharr channels every <strong>{poll_interval}s</strong>.
+            Clients matching the identifier <strong>{identifier_display}</strong> are tracked.
+            If a matching client stops receiving data for <strong>{timeout}s</strong>, its connection is terminated.
+            When an Emby/Jellyfin server URL is configured, the plugin also cross-references active
+            media server sessions to detect <strong>orphaned</strong> connections that the server failed to close.
             Non-matching clients are <strong>never</strong> affected.
         </div>
 
-        <h2>Tracked Channels</h2>
+        <h2>Active Channels</h2>
         {channels_html}
-        <div class="refresh-note">Auto-refreshes every 5 seconds</div>
+        {log_html}
+        <div class="refresh-note">Auto-refreshes every {refresh_interval} seconds</div>
     </div>
 </body>
 </html>"""
-                start_response('200 OK', [('Content-Type', 'text/html; charset=utf-8')])
-                return [html.encode('utf-8')]
-            except Exception as e:
-                logger.error(f"Error generating debug page: {e}", exc_info=True)
-                start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
-                return [b"Error generating debug page\n"]
 
-        elif path == '/':
-            plugin_name = PLUGIN_CONFIG.get('name', 'Emby Stream Cleanup')
-            plugin_version = PLUGIN_CONFIG.get('version', 'unknown version').lstrip('-')
-            plugin_description = PLUGIN_CONFIG.get('description', '')
-            repo_url = PLUGIN_CONFIG.get('repo_url', 'https://github.com/sethwv/emby-stream-cleanup')
+    # -- Landing page ----------------------------------------------------------
 
-            html = f"""<!DOCTYPE html>
+    def _serve_landing_page(self, start_response):
+        plugin_name = PLUGIN_CONFIG.get('name', 'Emby Stream Cleanup')
+        plugin_version = PLUGIN_CONFIG.get('version', 'unknown version').lstrip('-')
+        plugin_description = PLUGIN_CONFIG.get('description', '')
+        repo_url = PLUGIN_CONFIG.get('repo_url', 'https://github.com/sethwv/emby-stream-cleanup')
+
+        monitor_status = "Running" if self.monitor.is_running() else "Stopped"
+
+        html = f"""<!DOCTYPE html>
 <html>
 <head>
     <title>{plugin_name}</title>
@@ -506,19 +459,7 @@ class WebhookServer:
         a:hover {{ text-decoration: underline; }}
         .links {{ margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; }}
         .links a {{ display: inline-block; margin-right: 20px; font-weight: 500; }}
-        code {{
-            background: #f0f0f0;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 13px;
-        }}
-        .webhook-url {{
-            background: #e8f5e9;
-            padding: 10px 15px;
-            border-radius: 4px;
-            font-family: monospace;
-            margin: 15px 0;
-        }}
+        .status {{ font-size: 13px; color: #666; margin-top: 10px; }}
     </style>
 </head>
 <body>
@@ -526,26 +467,22 @@ class WebhookServer:
         <h1>{plugin_name}</h1>
         <div class="version">{plugin_version}</div>
         <p>{plugin_description}</p>
-        <p>Configure this URL in Emby's webhook settings:</p>
-        <div class="webhook-url">POST http://&lt;dispatcharr-host&gt;:{self.port}/webhook</div>
+        <p class="status">Monitor: <strong>{monitor_status}</strong></p>
         <div class="links">
-            <a href="/debug">Debug</a>
-            <a href="/debug/webhook">Webhook Inspector</a>
+            <a href="/debug">Debug Dashboard</a>
             <a href="/health">Health Check</a>
             <a href="{repo_url}" target="_blank">GitHub</a>
         </div>
     </div>
 </body>
 </html>"""
-            start_response('200 OK', [('Content-Type', 'text/html; charset=utf-8')])
-            return [html.encode('utf-8')]
+        start_response('200 OK', [('Content-Type', 'text/html; charset=utf-8')])
+        return [html.encode('utf-8')]
 
-        else:
-            start_response('404 Not Found', [('Content-Type', 'text/plain')])
-            return [b"Not Found\n"]
+    # -- Client row rendering --------------------------------------------------
 
     @staticmethod
-    def _render_client_row(client, is_match):
+    def _render_client_row(client, is_match, timeout=30):
         """Render a single Dispatcharr client as an HTML row."""
         row_class = "match" if is_match else "safe"
         ip = client.get("ip", "?")
@@ -553,12 +490,23 @@ class WebhookServer:
         user_agent = client.get("user_agent", "")
         duration = client.get("connected_duration", "")
         match_reason = client.get("match_reason", "")
+        idle_seconds = client.get("idle_seconds")
+        in_grace = client.get("in_grace", False)
 
         label_html = ""
         if is_match:
-            label_html = f'<span class="match-reason">WILL TERMINATE ({match_reason})</span>'
+            if client.get("is_orphan"):
+                label_html = '<span class="match-reason orphan-warn">ORPHAN (no active media server session &mdash; will terminate)</span>'
+            elif in_grace and idle_seconds is not None and idle_seconds >= timeout:
+                label_html = f'<span class="match-reason" style="color:#1565c0">GRACE PERIOD (idle {int(idle_seconds)}s &mdash; termination paused)</span>'
+            elif idle_seconds is not None and idle_seconds >= timeout:
+                label_html = f'<span class="match-reason idle-warn">WILL TERMINATE (idle {int(idle_seconds)}s / {timeout}s timeout)</span>'
+            elif idle_seconds is not None:
+                label_html = f'<span class="match-reason">MONITORED ({match_reason}) - idle {int(idle_seconds)}s</span>'
+            else:
+                label_html = f'<span class="match-reason">MONITORED ({match_reason})</span>'
         else:
-            label_html = '<span class="safe-label">SAFE — won\'t be affected</span>'
+            label_html = '<span class="safe-label">SAFE - not affected</span>'
 
         fields = [f'<span class="client-field"><span class="label">IP:</span> <span class="value">{ip}</span></span>']
         if username:
@@ -574,50 +522,27 @@ class WebhookServer:
             <div class="client-detail">{"".join(fields)}</div>
         </div>'''
 
-    # ── Lifecycle ────────────────────────────────────────────────────────────
+    # -- Lifecycle -------------------------------------------------------------
 
     def start(self, settings=None) -> bool:
-        """Start the webhook server in a background thread.
-
-        Returns True on success, False if the server could not be started.
-        """
+        """Start the debug server in a background thread."""
         if self.running:
-            logger.warning("Webhook server is already running")
+            logger.warning("Debug server is already running")
             return False
 
         # Guard against duplicate servers across workers via Redis
         redis_client = get_redis_client()
         if redis_client and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
-            logger.warning("Another webhook server instance is already running (detected via Redis)")
+            logger.warning("Another debug server instance is already running (detected via Redis)")
             return False
 
-        # Guard against a duplicate in the same process
         current = get_current_server()
         if current and current.is_running():
-            logger.warning("Another webhook server instance is already running in this process")
+            logger.warning("Another debug server instance is already running in this process")
             return False
 
-        # Check Dispatcharr version
-        min_version = PLUGIN_CONFIG.get("min_dispatcharr_version", "1.0.0")
-        try:
-            dispatcharr_version, dispatcharr_timestamp, full_version = get_dispatcharr_version()
-            if dispatcharr_version != "unknown":
-                if dispatcharr_timestamp:
-                    logger.info(f"Dev build detected ({full_version}), skipping version check")
-                elif not compare_versions(dispatcharr_version, min_version):
-                    logger.error(
-                        f"Dispatcharr {dispatcharr_version} does not meet minimum requirement {min_version}"
-                    )
-                    return False
-                else:
-                    logger.info(f"Dispatcharr {dispatcharr_version} meets minimum requirement {min_version}")
-            else:
-                logger.warning("Could not determine Dispatcharr version, skipping check")
-        except Exception as e:
-            logger.warning(f"Could not verify Dispatcharr version: {e}. Proceeding anyway.")
-
         # Validate host / port binding
-        logger.info(f"Attempting to bind to host='{self.host}', port={self.port}")
+        logger.info(f"Attempting to bind debug server to host='{self.host}', port={self.port}")
         try:
             try:
                 socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM)
@@ -649,8 +574,6 @@ class WebhookServer:
 
             def run_server():
                 try:
-                    logger.debug(f"Starting gevent WSGI server on {self.host}:{self.port}")
-
                     suppress_logs = self.settings.get('suppress_access_logs', True)
                     server_kwargs = {
                         'listener': (self.host, self.port),
@@ -673,18 +596,17 @@ class WebhookServer:
                         except Exception as e:
                             logger.warning(f"Could not set Redis running flags: {e}")
 
-                    logger.info(f"Webhook server started on http://{self.host}:{self.port}/webhook")
+                    logger.info(f"Debug server started on http://{self.host}:{self.port}/")
 
                     from gevent import spawn, sleep
                     spawn(self.server.serve_forever)
 
                     # Monitor for Redis stop signal
                     monitor_redis = get_redis_client()
-                    check_count = 0
                     while self.running:
                         try:
                             if monitor_redis and read_redis_flag(monitor_redis, REDIS_KEY_STOP):
-                                logger.info("Stop signal detected via Redis, shutting down")
+                                logger.info("Debug server stop signal detected via Redis")
                                 self.running = False
                                 try:
                                     self.server.stop(timeout=5)
@@ -694,20 +616,13 @@ class WebhookServer:
                                 break
                             elif not monitor_redis:
                                 monitor_redis = get_redis_client()
-
-                            check_count += 1
-                            if check_count % 60 == 0:
-                                logger.debug(
-                                    f"Stop signal monitor alive (check #{check_count}), "
-                                    f"server running on {self.host}:{self.port}"
-                                )
                         except Exception as e:
-                            logger.warning(f"Error checking stop signal (check #{check_count}): {e}")
+                            logger.warning(f"Error checking stop signal: {e}")
                             monitor_redis = get_redis_client()
 
                         sleep(1)
 
-                    # Cleanup Redis flags after stopping
+                    # Cleanup Redis flags
                     _rc = get_redis_client()
                     if _rc:
                         try:
@@ -716,33 +631,28 @@ class WebhookServer:
                             logger.warning(f"Could not clear Redis flags on shutdown: {e}")
 
                     set_current_server(None)
-                    logger.info("Webhook server stopped and cleaned up")
+                    logger.info("Debug server stopped and cleaned up")
 
                 except Exception as e:
-                    logger.error(f"Error running webhook server: {e}", exc_info=True)
+                    logger.error(f"Error running debug server: {e}", exc_info=True)
                     self.running = False
 
             self.server_thread = threading.Thread(target=run_server, daemon=True)
             self.server_thread.start()
 
-            # Brief wait for the server to bind and set running=True
             time.sleep(0.5)
-
-            if self.running:
-                return True
-            else:
-                return False
+            return self.running
 
         except ImportError:
             logger.error("gevent is not installed")
             return False
 
     def stop(self) -> bool:
-        """Stop the webhook server."""
+        """Stop the debug server."""
         if not self.running:
             return False
 
-        logger.info("Stopping webhook server...")
+        logger.info("Stopping debug server...")
 
         if self.server:
             try:
@@ -754,7 +664,6 @@ class WebhookServer:
         self.running = False
         set_current_server(None)
 
-        # Clear Redis flags
         redis_client = get_redis_client()
         if redis_client:
             try:
@@ -765,5 +674,4 @@ class WebhookServer:
         return True
 
     def is_running(self) -> bool:
-        """Return True if the server thread is alive and the server is marked running."""
         return self.running and self.server_thread is not None and self.server_thread.is_alive()

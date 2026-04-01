@@ -1,12 +1,13 @@
-"""Auto-start logic for the Emby Stream Cleanup webhook server.
+"""Auto-start logic for the Emby Stream Cleanup monitor.
 
 Uses Redis leader election (SET NX EX) so only one uWSGI worker starts the
-server, even across multiple processes.
+monitor, even across multiple processes.
 
   1. Each worker calls ``attempt_autostart()`` from ``Plugin.__init__``.
   2. Background thread waits for Django ORM, reads plugin config.
   3. Races all workers with SET NX EX on a leader key.
-  4. Winner clears stale state and starts the WebhookServer.
+  4. Winner clears stale state and starts the StreamMonitor (and optionally
+     the debug server).
 """
 
 import logging
@@ -25,11 +26,11 @@ _RETRY_DELAY  = 3   # seconds between subsequent attempts
 _MAX_ATTEMPTS = 8   # total attempts to read PluginConfig from the DB
 
 
-def attempt_autostart(handler) -> None:
+def attempt_autostart(monitor) -> None:
     """Entry point from ``Plugin.__init__``.
 
     Spawns a daemon thread (at most once per OS process) that races via Redis
-    NX to become the autostart leader and start the webhook server.
+    NX to become the autostart leader and start the monitor.
     """
     global _autostart_launched
     with _autostart_lock:
@@ -40,9 +41,9 @@ def attempt_autostart(handler) -> None:
 
     threading.Thread(
         target=_autostart_worker,
-        args=(handler,),
+        args=(monitor,),
         daemon=True,
-        name="emby-cleanup-autostart",
+        name="emby-stream-autostart",
     ).start()
 
 
@@ -60,11 +61,11 @@ def cleanup_stale_state(redis_client) -> None:
         logger.warning(f"Startup cleanup failed: {e}")
 
 
-def _autostart_worker(handler) -> None:
+def _autostart_worker(monitor) -> None:
     """Background thread body."""
     from .config import (
         PLUGIN_CONFIG, REDIS_KEY_LEADER, LEADER_TTL,
-        DEFAULT_PORT, DEFAULT_HOST, AUTO_START_DEFAULT, PLUGIN_DB_KEY,
+        DEFAULT_PORT, DEFAULT_HOST, PLUGIN_DB_KEY,
     )
     from .utils import get_redis_client, normalize_host
 
@@ -90,13 +91,11 @@ def _autostart_worker(handler) -> None:
                 )
                 continue
             settings_dict = config.settings or {}
-            auto_start_enabled = bool(
-                config.enabled
-                and settings_dict.get('auto_start', AUTO_START_DEFAULT)
-            )
+            if not config.enabled:
+                logger.debug("Emby stream cleanup: plugin is disabled, skipping auto-start")
+                return
             logger.debug(
-                f"Emby stream cleanup: auto-start config read on attempt {attempt + 1}: "
-                f"plugin_enabled={config.enabled}, auto_start={auto_start_enabled}"
+                f"Emby stream cleanup: config read on attempt {attempt + 1}, plugin enabled"
             )
             break
         except Exception as e:
@@ -109,11 +108,15 @@ def _autostart_worker(handler) -> None:
         )
         return
 
-    if not auto_start_enabled:
-        logger.debug("Emby stream cleanup: auto-start disabled in settings")
+    # Check that an identifier is configured
+    client_identifier = (settings_dict.get("client_identifier") or "").strip()
+    if not client_identifier:
+        logger.warning(
+            "Emby stream cleanup: auto-start skipped because client_identifier is not configured"
+        )
         return
 
-    # ── Leader election via Redis SET NX ─────────────────────────────────────
+    # -- Leader election via Redis SET NX --------------------------------------
     redis_client = get_redis_client()
     if redis_client is None:
         logger.warning("Emby stream cleanup: cannot connect to Redis, aborting auto-start")
@@ -127,27 +130,35 @@ def _autostart_worker(handler) -> None:
 
     logger.debug(f"Emby stream cleanup: won leader election (worker {worker_id})")
 
-    # ── Clean stale state then start server ──────────────────────────────────
+    # -- Clean stale state then start monitor ----------------------------------
     cleanup_stale_state(redis_client)
 
-    port = int(settings_dict.get('port', DEFAULT_PORT))
-    host = normalize_host(
-        settings_dict.get('host', DEFAULT_HOST),
-        DEFAULT_HOST,
-    )
-
-    from .server import WebhookServer
-    server = WebhookServer(handler, port=port, host=host)
-    if server.start(settings=settings_dict):
-        logger.info(
-            f"Emby stream cleanup: auto-start successful on http://{host}:{port}/webhook"
-        )
+    if monitor.start(settings=settings_dict):
+        logger.info("Emby stream cleanup: auto-start monitor successful")
     else:
         try:
             redis_client.delete(REDIS_KEY_LEADER)
         except Exception:
             pass
         logger.warning(
-            "Emby stream cleanup: auto-start failed to start server. "
-            "Use 'Start Server' button to start manually."
+            "Emby stream cleanup: auto-start failed to start monitor. "
+            "Use 'Start Monitor' button to start manually."
         )
+        return
+
+    # Optionally start the debug server
+    if settings_dict.get("enable_debug_server", False):
+        port = int(settings_dict.get('port', DEFAULT_PORT))
+        host = normalize_host(
+            settings_dict.get('host', DEFAULT_HOST),
+            DEFAULT_HOST,
+        )
+
+        from .server import DebugServer
+        server = DebugServer(monitor, port=port, host=host)
+        if server.start(settings=settings_dict):
+            logger.info(
+                f"Emby stream cleanup: auto-start debug server on http://{host}:{port}/debug"
+            )
+        else:
+            logger.warning("Emby stream cleanup: auto-start debug server failed")
