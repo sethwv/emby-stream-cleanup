@@ -38,6 +38,7 @@ REDIS_KEY_PORT     = "emby_cleanup:server_port"
 REDIS_KEY_STOP     = "emby_cleanup:stop_requested"
 REDIS_KEY_LEADER   = "emby_cleanup:leader"
 REDIS_KEY_MONITOR  = "emby_cleanup:monitor_running"
+REDIS_KEY_MANUAL_STOP = "emby_cleanup:manual_stop"
 
 # Keys to wipe on startup (leader key intentionally excluded so the winning
 # worker keeps its claim after cleanup).
@@ -47,6 +48,7 @@ CLEANUP_REDIS_KEYS = [
     REDIS_KEY_PORT,
     REDIS_KEY_STOP,
     REDIS_KEY_MONITOR,
+    REDIS_KEY_MANUAL_STOP,
 ]
 
 # Complete set of every key ever written by this plugin

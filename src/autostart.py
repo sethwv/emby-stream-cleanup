@@ -150,6 +150,18 @@ def _autostart_worker(monitor) -> None:
         )
         return
 
+    # -- Respect manual stop ---------------------------------------------------
+    # If the user manually stopped the monitor during this Dispatcharr runtime,
+    # a Redis flag is set.  It's cleared on fresh boot (CLEANUP_REDIS_KEYS).
+    try:
+        from .config import REDIS_KEY_MANUAL_STOP
+        _rc = get_redis_client()
+        if _rc and _rc.get(REDIS_KEY_MANUAL_STOP):
+            logger.debug("Emby stream cleanup: auto-start skipped (manually stopped)")
+            return
+    except Exception:
+        pass
+
     # -- Leader election via Redis SET NX --------------------------------------
     redis_client = get_redis_client()
     if redis_client is None:

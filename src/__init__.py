@@ -105,13 +105,22 @@ class Plugin:
 
         # -- stop_debug_server -------------------------------------------------
         elif action == "stop_debug_server":
+            # Flag manual stop so autostart won't re-launch during this runtime.
+            # The flag is cleared on fresh Dispatcharr boot (CLEANUP_REDIS_KEYS).
+            redis_client = get_redis_client()
+            if redis_client:
+                try:
+                    from .config import REDIS_KEY_MANUAL_STOP
+                    redis_client.set(REDIS_KEY_MANUAL_STOP, "1")
+                except Exception:
+                    pass
+
             server = get_current_server()
             if server and server.is_running():
                 server.stop()
                 return {"status": "success", "message": "Debug server stopped"}
 
             # Signal remote worker
-            redis_client = get_redis_client()
             if redis_client and read_redis_flag(redis_client, REDIS_KEY_RUNNING):
                 redis_client.set(REDIS_KEY_STOP, "1")
                 for _ in range(50):
