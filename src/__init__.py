@@ -37,6 +37,14 @@ class Plugin:
 
     actions = [
         {
+            "id": "restart_monitor",
+            "label": "Restart Monitor",
+            "description": "Restart the stream monitor to apply config changes",
+            "button_label": "Restart Monitor",
+            "button_variant": "filled",
+            "button_color": "orange",
+        },
+        {
             "id": "start_debug_server",
             "label": "Start Debug Server",
             "description": "Start the debug dashboard HTTP server",
@@ -74,8 +82,23 @@ class Plugin:
         logger_ctx = context.get("logger", logger)
         settings   = context.get("settings", {})
 
+        # -- restart_monitor ---------------------------------------------------
+        if action == "restart_monitor":
+            try:
+                if _monitor.is_running():
+                    _monitor.stop()
+                    # Brief pause so Redis keys are cleaned up before restart
+                    time.sleep(0.5)
+
+                if _monitor.start(settings=settings):
+                    return {"status": "success", "message": "Stream monitor restarted with current settings"}
+                return {"status": "error", "message": "Failed to start stream monitor"}
+            except Exception as e:
+                logger_ctx.error(f"Error restarting monitor: {e}", exc_info=True)
+                return {"status": "error", "message": f"Failed to restart monitor: {str(e)}"}
+
         # -- start_debug_server ------------------------------------------------
-        if action == "start_debug_server":
+        elif action == "start_debug_server":
             server = get_current_server()
             if server and server.is_running():
                 return {
